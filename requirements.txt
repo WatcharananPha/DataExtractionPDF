@@ -1,0 +1,4 @@
+google-generativeai
+pypdf
+pdf2image
+pillow
