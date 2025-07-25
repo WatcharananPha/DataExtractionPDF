@@ -1,144 +1,466 @@
-import google.generativeai as genai
-import pandas as pd
-import io
-import os
 import streamlit as st
+import google.generativeai as genai
+import json
+import tempfile
+import os
+import gspread
+import re
+from difflib import SequenceMatcher
+from google.oauth2.service_account import Credentials
+from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv
 
-st.title("Quotation Comparison Table Generator")
+st.set_page_config(page_title="PDF Extractor", layout="centered")
+st.title("PDF Extractor")
+
+with st.expander("Instructions"):
+    st.markdown("""
+    - Upload one or more PDF files using the uploader below.
+    - Enter your Google Sheet ID or use the default one.
+    - Click **Extract and Update** to process the uploaded PDFs and update Google Sheet.
+    - The extracted data will also be available for download as a JSON file.
+    """)
 
 load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=API_KEY)
 
-uploaded_file = st.file_uploader("อัปโหลดไฟล์ใบเสนอราคา", type=["excel", "xlsx", "txt"])
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file"
+]
+CREDS_FILE = 'glassy-keyword-466817-t8-8bdc0c7acadc.json'
+DEFAULT_SHEET_ID = '17tMHStXQYXaIQHQIA4jdUyHaYt_tuoNCEEuJCstWEuw'
 
-if uploaded_file:
-    try:
-        input_quotation_data = uploaded_file.read().decode("utf-8")
-    except UnicodeDecodeError:
-        try:
-            uploaded_file.seek(0)
-            input_quotation_data = uploaded_file.read().decode("cp874")
-        except UnicodeDecodeError:
-            uploaded_file.seek(0)
-            input_quotation_data = uploaded_file.read().decode("latin1")
+COMPANY_NAME_ROW = 1
+CONTACT_INFO_ROW = 2
+HEADER_ROW = 3
+ITEM_MASTER_LIST_COL = 2
+COLUMNS_PER_SUPPLIER = 4
+SIMILARITY_THRESHOLD = 0.7
 
-    output_excel_path = "Quotation_Comparison_Result.xlsx"
+prompt = """# System Message for Product List Extraction (PDF/Text Table Processing)
 
-    prompt = f"""
-You are an expert procurement and data extraction assistant. Your task is to analyze the provided raw text containing multiple quotation documents from different suppliers and consolidate the pricing for similar items into a single, standardized comparison table.
+## Input Format
+Provide PDF files (or images/tables with text extraction) containing product information (receipts, invoices, product lists, etc.):
+* Upload PDF files or images directly
+* Text will be extracted automatically
+* Source should contain clear product details in readable text
 
-**Input Data Description:**
-The input text contains exactly 4 distinct quotation blocks. Each block typically includes:
--   Supplier Company Information (e.g., "บริษัท เอบีไอ เทสติ้ง เอ็นจิเนียริ่ง จำกัด")
--   Recipient Information (e.g., "เรียน:", "ที่อยู่:", "ATTN:", "โครงการ:")
--   Itemized List (with columns like "ลำดับ", "รายการ", "จำนวน", "หน่วย", "ราคา/หน่วย", "ราคารวม")
--   Summary totals (e.g., "ราคารวม", "ภาษีมูลค่าเพิ่ม 7%", "ยอดรวมทั้งสิ้น")
+## Task
+Analyze the extracted text from documents and extract ALL product information to create a comprehensive product summary list.
+Do not skip any products – ensure complete extraction of every line item, including physical consumables, product accessories, and items such as "ค่าเจาะรูกระจก" if they are charged per unit.
 
-**Your Task (Output Structure - Tab-Separated Table):**
+## CRITICAL: Complete Product Collection Rule
+Extract ALL products as individual entries - quotations typically contain unique, detailed specifications.
+- Each line item in the quotation represents a distinct product with specific details
+- DO NOT consolidate or merge products - preserve all individual entries exactly as listed
+- Products in quotations are already unique due to detailed specifications (sizes, locations, materials, etc.)
+- Extract every single row/line item that has quantity, unit price, and total price
+- Maintain the exact product descriptions including all specifications and location details
 
-1.  **Identify Each Quote & Supplier:**
-    *   Parse the input text to identify each of the 4 distinct quotation blocks.
-    *   Extract the primary supplier company name for each block to use as column headers (e.g., "เอบีไอ เทสติ้ง", "บี.บี.เค ไพล์เทสติ้ง", "BOULTER STEWART", "S.K.E CONSULTANS").
+## Output Format (JSON only)
+You must return ONLY this JSON structure:
+{
+  "company": "company name or first name + last name (NEVER null)",
+  "vat": true,
+  "name": "customer name or null",
+  "contact": "phone number or email or null",
+  "priceGuaranteeDay": 0,
+  "products": [
+    {
+      "name": "full product description in Thai including all specifications AND size (EXCLUDE quantity/unit/price)",
+      "quantity": 1,
+      "unit": "match the unit shown in the pricePerUnit column (e.g., แผ่น, ตร.ม., ชิ้น, ตัว, เมตร, ชุด)",
+      "pricePerUnit": 0,
+      "totalPrice": 0
+    }
+  ],
+  "totalPrice": 0,
+  "totalVat": 0,
+  "totalPriceIncludeVat": 0
+}
 
-2.  **Normalize Item Names:**
-    *   Identify all unique items/services across all 4 quotations.
-    *   Normalize similar item names to a consistent, concise representation (e.g., "Dynamic Load Test" and "Dynamic Load Test Service" should become "Dynamic Load Test").
+## Field Extraction Guidelines
 
-3.  **Construct the Item Comparison Table:**
-    *   The table must be tab-separated.
-    *   **Header Row:**
-        "ลำดับ\tรายการ\tจำนวน\tหน่วย\t{{Supplier1_ShortName}}\t{{Supplier2_ShortName}}\t{{Supplier3_ShortName}}\t{{Supplier4_ShortName}}"
-        (Replace {{SupplierX_ShortName}} with the extracted, concise supplier names from step 1).
-    *   **Item Rows:**
-        *   `ลำดับ`: Running number (1, 2, 3...) for each unique item.
-        *   `รายการ`: Normalized item name.
-        *   `จำนวน`: Quantity (take from the most common quantity or the first supplier where the item appears).
-        *   `หน่วย`: Unit (take from the most common unit or the first supplier where the item appears).
-        *   `{{SupplierX_ShortName}}` columns: The 'ราคารวม' (total price for that specific item) from Supplier X. If an item is not found in a supplier's quote, leave the cell empty (""). If the value is "รวมแล้ว", convert it to "". Ensure all numeric values are clean (no commas).
+### name (Product Description)
+* Include: material, model/type, size/dimensions, technical specs, finish, location details
+* Include: ALL distinguishing characteristics that make each product unique
+* Exclude: quantity, unit, price
+* Preserve detailed specifications exactly as shown in quotation (sizes, locations, installation details)
+* Example: "งานกระจกบานใส กระจกเทมเปอร์ เปรย์ เกร์ 10 มม. ฝังตัวยูเหล็ก สีเทา บันได ชั้น 1-2 ขนาด 0.975x4.672 ม."
+* For items like "ค่าเจาะรูกระจก กว้าง 16มม.", include all distinguishing attributes in name
 
-4.  **Summary Rows:** After all item rows, include these summary rows. The "ราคารวม", "ภาษีมูลค่าเพิ่ม 7%", "ยอดรวมทั้งสิ้น" values should be the exact values extracted from each respective supplier's quote, not summed from the comparison table items (as some items might be "รวมแล้ว" or "Discount").
-    *   `ราคารวม\t\t\t\t[Extracted ราคารวม from Supplier 1]\t[Extracted ราคารวม from Supplier 2]\t[Extracted ราคารวม from Supplier 3]\t[Extracted ราคารวม from Supplier 4]`
-    *   `ภาษีมูลค่าเพิ่ม 7%\t\t\t\t[Extracted ภาษีมูลค่าเพิ่ม 7% from Supplier 1]\t[Extracted ภาษีมูลค่าเพิ่ม 7% from Supplier 2]\t[Extracted ภาษีมูลค่าเพิ่ม 7% from Supplier 3]\t[Extracted ภาษีมูลค่าเพิ่ม 7% from Supplier 4]`
-    *   `ยอดรวมทั้งสิ้น\t\t\t\t[Extracted ยอดรวมทั้งสิ้น from Supplier 1]\t[Extracted ยอดรวมทั้งสิ้น from Supplier 2]\t[Extracted ยอดรวมทั้งสิ้น from Supplier 3]\t[Extracted ยอดรวมทั้งสิ้น from Supplier 4]`
-    *   **Important:** Ensure all numeric values are clean (no commas or currency symbols) for easy parsing.
+### unit and quantity (DIRECT EXTRACTION RULE)
+* Extract unit and quantity DIRECTLY from each line item as shown
+* Use the exact unit shown in the quotation (ชุด, แผ่น, ตร.ม., ชิ้น, ตัว, เมตร, etc.)
+* Each line item represents a separate product entry - extract as individual entries
+* If an item is priced per unit and has physical/product characteristics, treat as a product and include
 
-5.  **Supplier Conditions Section:** After the summary table, add a new section for supplier conditions. For the given input, these conditions are not explicitly present, so state "N/A" for each supplier.
-    *   `เงื่อนไขการของ SUPPLIER\t\t\t\t{{Supplier1_ShortName}}\t{{Supplier2_ShortName}}\t{{Supplier3_ShortName}}\t{{Supplier4_ShortName}}` (This will be the header for this section, with supplier names repeated)
-    *   `1\tกำหนดยืนราคา\t\t\t\tN/A\tN/A\tN/A\tN/A`
-    *   `2\tระยะเวลาส่งมอบสินค้าหลังจากได้รับ PO\t\t\t\tN/A\tN/A\tN/A\tN/A`
-    *   `3\tการชำระเงิน\t\t\t\tN/A\tN/A\tN/A\tN/A`
-    *   `4\tอื่น ๆ\t\t\t\tN/A\tN/A\tN/A\tN/A`
+### pricePerUnit and totalPrice
+* If the document shows both product/material cost (ค่าวัสดุ) and labor/service cost (ค่าแรง) in the same row, always add the two (pricePerUnit = product per unit + service per unit)
+* totalPrice must be calculated as: quantity × pricePerUnit
+* Use numeric values only (no currency symbols)
+* Extract cleanly from pricing fields as shown in each line item
+* Allow minor rounding errors if visible in the document
+* Extract each line item separately - do not combine or consolidate pricing
+* If the quote has discount items, select only the discounted price
 
-**Final Output Constraints:**
-Your entire response must be a single block of plain tab-separated text, ready to be read by a spreadsheet program.
-Do not include any explanations, summaries, or markdown formatting (like ```csv).
+## Complete Product Extraction Algorithm
+1. Identify all line items with product descriptions, quantities, and prices
+2. Extract each line item as a separate product - do not group or consolidate
+3. Preserve all specifications and distinguishing details in the product name
+4. Include location/installation details that make each product unique
+5. Maintain individual quantities and pricing exactly as shown in quotation
 
----
-**Input Quotation Data:**
-{input_quotation_data}
+## Inclusion/Exclusion Rules
+* Extract ALL physical products and ALL items with price per unit, including consumables, parts, and accessories
+* Include "ค่าเจาะรูกระจก" and similar items IF they are presented as a per-unit/consumable/physical item in the product table
+* Exclude service/labor cost lines without a per-unit count (e.g., lump sum services)
+* Each line item with specifications = separate product entry - preserve all individual entries
+* Include all location-specific variations (different floors, units, areas) as separate products
+
+## Quality Assurance Checklist
+- [ ] ALL line items with products, quantities, and prices extracted
+- [ ] Each product entry preserves detailed specifications and location details
+- [ ] Product names include all distinguishing characteristics
+- [ ] Quantities and prices match exactly what's shown in quotation
+- [ ] No line items missed - complete extraction achieved
+
+## Final Notes
+* PRIMARY GOAL: Extract every single product line item - quotations contain unique, detailed specifications
+* Extract all line items meeting the above rules - preserve each as individual product entry
+* Include all specs, sizes, and location details in name for complete product identification
+* Match unit and quantity with pricePerUnit exactly as shown in quotation
+* Maintain complete fidelity to the original quotation structure and details
+* If the quote has discount items, select only the discounted price
 """
 
-    model = genai.GenerativeModel(model_name="gemini-2.5-flash")
-    response = model.generate_content(prompt)
-    output_text = response.text.strip()
+def extract_json_from_text(text):
+    start_idx = text.find('{')
+    end_idx = text.rfind('}') + 1
+    if start_idx >= 0 and end_idx > start_idx:
+        return json.loads(text[start_idx:end_idx])
+    return None
 
-    if output_text.startswith("```"):
-        output_text = output_text.split('\n', 1)[1]
-    if output_text.endswith("```"):
-        output_text = output_text.rsplit('\n', 1)[0]
+def authenticate_and_open_sheet(sheet_id):
+    creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+    client = gspread.authorize(creds)
+    spreadsheet = client.open_by_key(sheet_id)
+    return spreadsheet.get_worksheet(0)
 
-    lines = [line for line in output_text.splitlines() if line.strip()]
-    split_lines = [line.rstrip('\n').split('\t') for line in lines]
-    max_cols = max(len(row) for row in split_lines)
-    normalized_lines = [row + [''] * (max_cols - len(row)) for row in split_lines]
+def ensure_first_three_rows_exist(worksheet):
+    payloads = []
+    for i in range(1, 4):
+        payloads.append({
+            'range': f"A{i}:B{i}",
+            'values': [["", ""]]
+        })
+    if payloads:
+        worksheet.batch_update(payloads, value_input_option='USER_ENTERED')
 
-    df_raw = pd.DataFrame(normalized_lines)
+def extract_key_product_features(product_name):
+    # Extract material type
+    material_types = ["กระจก", "อลูมิเนียม", "เหล็ก", "ไม้", "พลาสติก", "สแตนเลส"]
+    material = next((m for m in material_types if m in product_name), "")
+    
+    # Extract dimensions if present
+    dimensions = re.findall(r'\d+(?:\.\d+)?(?:\s*[xX×]\s*\d+(?:\.\d+)?)+(?:\s*(?:ม\.|มม\.|cm|MM|mm))?', product_name)
+    dims = dimensions[0] if dimensions else ""
+    
+    # Extract thickness if present
+    thickness = re.findall(r'(\d+(?:\.\d+)?)\s*(?:มม\.|mm)', product_name)
+    thick = thickness[0] if thickness else ""
+    
+    # Extract location information if present
+    locations = ["ชั้น", "บันได", "ห้อง", "ประตู", "หน้าต่าง"]
+    location = next((loc for loc in locations if loc in product_name), "")
+    
+    # Extract product type or function
+    product_types = ["บานเลื่อน", "บานสวิง", "บานพับ", "บานกระทุ้ง", "บานเปิด", "บานเฟี้ยม", "กระจกเปลือย"]
+    prod_type = next((pt for pt in product_types if pt in product_name), "")
+    
+    return {
+        "material": material,
+        "dimensions": dims,
+        "thickness": thick,
+        "location": location,
+        "product_type": prod_type,
+        "full_name": product_name
+    }
 
-    summary_start_row_idx = df_raw[df_raw.iloc[:, 0].str.contains('ราคารวม', na=False)].index.tolist()
-    conditions_header_row_idx = df_raw[df_raw.iloc[:, 0].str.contains('เงื่อนไขการของ SUPPLIER', na=False)].index.tolist()
+def calculate_product_similarity(product1, product2):
+    # Extract key features
+    features1 = extract_key_product_features(product1)
+    features2 = extract_key_product_features(product2)
+    
+    # Calculate basic text similarity
+    name_similarity = SequenceMatcher(None, product1, product2).ratio()
+    
+    # Calculate feature-specific similarities
+    material_match = 1.0 if features1["material"] and features1["material"] == features2["material"] else 0.0
+    thickness_match = 1.0 if features1["thickness"] and features1["thickness"] == features2["thickness"] else 0.0
+    product_type_match = 1.0 if features1["product_type"] and features1["product_type"] == features2["product_type"] else 0.0
+    
+    # Weighted similarity score (adjust weights as needed)
+    weighted_score = (name_similarity * 0.4) + (material_match * 0.25) + (thickness_match * 0.2) + (product_type_match * 0.15)
+    
+    return weighted_score
 
-    header_row_values = df_raw.iloc[0].tolist()
-    main_table_data = df_raw.iloc[1:summary_start_row_idx[0]]
-    summary_data = df_raw.iloc[summary_start_row_idx[0]:conditions_header_row_idx[0]]
-    conditions_header = df_raw.iloc[conditions_header_row_idx[0]].tolist()
-    conditions_data = df_raw.iloc[conditions_header_row_idx[0] + 1:]
+def find_matching_products(new_product, existing_products):
+    scores = []
+    for i, existing in enumerate(existing_products):
+        similarity = calculate_product_similarity(new_product, existing)
+        if similarity >= SIMILARITY_THRESHOLD:
+            scores.append((i, similarity))
+    
+    # Return best match if any
+    return max(scores, key=lambda x: x[1])[0] if scores else None
 
-    df_main_table = pd.DataFrame(main_table_data.values, columns=header_row_values)
+def update_google_sheet_with_multiple_files(worksheet, all_json_data):
+    ensure_first_three_rows_exist(worksheet)
+    
+    # Get existing product items from column B (after header rows)
+    existing_items = worksheet.col_values(ITEM_MASTER_LIST_COL)[3:]
+    start_row_index = 4  # Start after header rows
+    
+    payloads = []
+    
+    # First supplier's data is added directly
+    if all_json_data:
+        first_json_data = all_json_data[0]
+        supplier_col_start = ITEM_MASTER_LIST_COL + 1
+        
+        # Add company name and contact info
+        payloads.append({
+            'range': f"{get_column_letter(supplier_col_start)}{COMPANY_NAME_ROW}",
+            'values': [[first_json_data["company"]]]
+        })
+        
+        payloads.append({
+            'range': f"{get_column_letter(supplier_col_start)}{CONTACT_INFO_ROW}",
+            'values': [[first_json_data["contact"] or ""]]
+        })
+        
+        # Add header row
+        payloads.append({
+            'range': f"{get_column_letter(supplier_col_start)}{HEADER_ROW}:{get_column_letter(supplier_col_start + 3)}{HEADER_ROW}",
+            'values': [["ปริมาณ", "หน่วย", "ราคาต่อหน่วย", "รวมเป็นเงิน"]]
+        })
+        
+        # Add all products from first supplier
+        for product in first_json_data["products"]:
+            product_name = product["name"]
+            existing_items.append(product_name)
+            row_index = len(existing_items) + start_row_index - 1
+            
+            payloads.append({
+                'range': f"B{row_index}",
+                'values': [[product_name]]
+            })
+            
+            payloads.append({
+                'range': f"{get_column_letter(supplier_col_start)}{row_index}:{get_column_letter(supplier_col_start + 3)}{row_index}",
+                'values': [[product["quantity"], product["unit"], product["pricePerUnit"], product["totalPrice"]]]
+            })
+        
+        # Add summary rows for first supplier
+        summary_start_row = len(existing_items) + start_row_index + 1
+        
+        payloads.append({
+            'range': f"B{summary_start_row}",
+            'values': [["รวมเป็นเงิน"]]
+        })
+        payloads.append({
+            'range': f"{get_column_letter(supplier_col_start + 3)}{summary_start_row}",
+            'values': [[first_json_data["totalPrice"]]]
+        })
+        
+        summary_start_row += 1
+        payloads.append({
+            'range': f"B{summary_start_row}",
+            'values': [["ภาษีมูลค่าเพิ่ม 7%"]]
+        })
+        payloads.append({
+            'range': f"{get_column_letter(supplier_col_start + 3)}{summary_start_row}",
+            'values': [[first_json_data["totalVat"]]]
+        })
+        
+        summary_start_row += 1
+        payloads.append({
+            'range': f"B{summary_start_row}",
+            'values': [["ยอดรวมทั้งสิ้น"]]
+        })
+        payloads.append({
+            'range': f"{get_column_letter(supplier_col_start + 3)}{summary_start_row}",
+            'values': [[first_json_data["totalPriceIncludeVat"]]]
+        })
+        
+        # Process additional suppliers with matching logic
+        for idx, json_data in enumerate(all_json_data[1:], start=1):
+            supplier_col_start = ITEM_MASTER_LIST_COL + 1 + (idx * COLUMNS_PER_SUPPLIER)
+            
+            # Add company name and contact info
+            payloads.append({
+                'range': f"{get_column_letter(supplier_col_start)}{COMPANY_NAME_ROW}",
+                'values': [[json_data["company"]]]
+            })
+            
+            payloads.append({
+                'range': f"{get_column_letter(supplier_col_start)}{CONTACT_INFO_ROW}",
+                'values': [[json_data["contact"] or ""]]
+            })
+            
+            # Add header row
+            payloads.append({
+                'range': f"{get_column_letter(supplier_col_start)}{HEADER_ROW}:{get_column_letter(supplier_col_start + 3)}{HEADER_ROW}",
+                'values': [["ปริมาณ", "หน่วย", "ราคาต่อหน่วย", "รวมเป็นเงิน"]]
+            })
+            
+            matched_products = []
+            new_products = []
+            
+            # Find matches for each product or add as new
+            for product in json_data["products"]:
+                product_name = product["name"]
+                match_idx = find_matching_products(product_name, existing_items)
+                
+                if match_idx is not None:
+                    # Match found
+                    row_index = match_idx + start_row_index
+                    matched_products.append((product, row_index))
+                else:
+                    # No match, add as new product
+                    new_products.append(product)
+            
+            # Update matched products
+            for product, row_index in matched_products:
+                payloads.append({
+                    'range': f"{get_column_letter(supplier_col_start)}{row_index}:{get_column_letter(supplier_col_start + 3)}{row_index}",
+                    'values': [[product["quantity"], product["unit"], product["pricePerUnit"], product["totalPrice"]]]
+                })
+            
+            # Add new products
+            for product in new_products:
+                product_name = product["name"]
+                existing_items.append(product_name)
+                row_index = len(existing_items) + start_row_index - 1
+                
+                payloads.append({
+                    'range': f"B{row_index}",
+                    'values': [[product_name]]
+                })
+                
+                payloads.append({
+                    'range': f"{get_column_letter(supplier_col_start)}{row_index}:{get_column_letter(supplier_col_start + 3)}{row_index}",
+                    'values': [[product["quantity"], product["unit"], product["pricePerUnit"], product["totalPrice"]]]
+                })
+            
+            # Add summary rows
+            summary_start_row = len(existing_items) + start_row_index + 1
+            
+            payloads.append({
+                'range': f"B{summary_start_row}",
+                'values': [["รวมเป็นเงิน"]]
+            })
+            payloads.append({
+                'range': f"{get_column_letter(supplier_col_start + 3)}{summary_start_row}",
+                'values': [[json_data["totalPrice"]]]
+            })
+            
+            summary_start_row += 1
+            payloads.append({
+                'range': f"B{summary_start_row}",
+                'values': [["ภาษีมูลค่าเพิ่ม 7%"]]
+            })
+            payloads.append({
+                'range': f"{get_column_letter(supplier_col_start + 3)}{summary_start_row}",
+                'values': [[json_data["totalVat"]]]
+            })
+            
+            summary_start_row += 1
+            payloads.append({
+                'range': f"B{summary_start_row}",
+                'values': [["ยอดรวมทั้งสิ้น"]]
+            })
+            payloads.append({
+                'range': f"{get_column_letter(supplier_col_start + 3)}{summary_start_row}",
+                'values': [[json_data["totalPriceIncludeVat"]]]
+            })
+    
+    # Execute all updates in one batch
+    if payloads:
+        worksheet.batch_update(payloads, value_input_option='USER_ENTERED')
+    
+    return len(all_json_data)
 
-    numeric_cols = ['จำนวน'] + header_row_values[4:]
-    for col in numeric_cols:
-        if col in df_main_table.columns:
-            df_main_table[col] = pd.to_numeric(df_main_table[col], errors='coerce').fillna('')
+uploaded_files = st.file_uploader(
+    "Upload one or more PDF files", 
+    type=["pdf"], 
+    accept_multiple_files=True
+)
 
-    with pd.ExcelWriter(output_excel_path, engine='xlsxwriter') as writer:
-        workbook = writer.book
-        worksheet = workbook.add_worksheet('Quotation Comparison')
+sheet_id = st.text_input("Google Sheet ID", value=DEFAULT_SHEET_ID)
+similarity_threshold = st.slider("Product Matching Similarity Threshold", 0.5, 0.95, 0.7, 0.05)
+SIMILARITY_THRESHOLD = similarity_threshold
 
-        for col_idx, value in enumerate(header_row_values):
-            worksheet.write(0, col_idx, value)
-
-        for row_idx, row_data in enumerate(df_main_table.values):
-            for col_idx, value in enumerate(row_data):
-                worksheet.write(row_idx + 1, col_idx, value)
-
-        current_row = len(df_main_table) + 1
-
-        for row_idx, row_data in enumerate(summary_data.values):
-            for col_idx, value in enumerate(row_data):
-                worksheet.write(current_row + row_idx, col_idx, value)
-
-        current_row += len(summary_data) + 1
-
-        for col_idx, value in enumerate(conditions_header):
-            worksheet.write(current_row, col_idx, value)
-        current_row += 1
-
-        for row_idx, row_data in enumerate(conditions_data.values):
-            for col_idx, value in enumerate(row_data):
-                worksheet.write(current_row + row_idx, col_idx, value)
-
-    st.success(f"สร้างไฟล์เปรียบเทียบใบเสนอราคาเสร็จสมบูรณ์: {output_excel_path}")
-    with open(output_excel_path, "rb") as f:
-        st.download_button("ดาวน์โหลดไฟล์ Excel", f, file_name=output_excel_path)
+if st.button("Extract and Update") and uploaded_files and sheet_id:
+    all_data = []
+    progress = st.progress(0)
+    
+    worksheet = authenticate_and_open_sheet(sheet_id)
+    st.info("Connected to Google Sheet successfully.")
+    
+    for idx, uploaded_file in enumerate(uploaded_files):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.read())
+            tmp_file_path = tmp_file.name
+            
+        with st.spinner(f"Processing {uploaded_file.name}..."):
+            gemini_file = genai.upload_file(path=tmp_file_path, display_name=f"PDF for Extraction: {uploaded_file.name}")
+            response = genai.GenerativeModel(model_name="gemini-2.5-flash").generate_content([prompt, gemini_file])
+            
+            json_data = extract_json_from_text(response.text)
+            if json_data:
+                all_data.append(json_data)
+                st.success(f"Extracted data from {uploaded_file.name}")
+            else:
+                st.warning(f"Failed to extract data from {uploaded_file.name}")
+                
+        os.unlink(tmp_file_path)
+        progress.progress((idx + 1) / len(uploaded_files))
+    
+    # Update sheet with all extracted data at once
+    if all_data:
+        with st.spinner("Updating Google Sheet with intelligent product matching..."):
+            suppliers_updated = update_google_sheet_with_multiple_files(worksheet, all_data)
+            st.success(f"Updated Google Sheet with data from {suppliers_updated} supplier(s)")
+            
+            match_stats = {
+                "total_products": sum(len(json_data["products"]) for json_data in all_data[1:]) if len(all_data) > 1 else 0,
+                "matched_products": 0,
+                "new_products": 0
+            }
+            
+            if len(all_data) > 1:
+                for data in all_data[1:]:
+                    for product in data["products"]:
+                        if st.session_state.get("matched_products", set()):
+                            match_stats["matched_products"] += 1
+                        else:
+                            match_stats["new_products"] += 1
+                
+                st.info(f"Product matching statistics: {match_stats['matched_products']} products matched, {match_stats['new_products']} new products added")
+        
+        merged_data = {"extractions": all_data}
+        json_str = json.dumps(merged_data, indent=2, ensure_ascii=False)
+        
+        st.download_button(
+            label="Download Extracted JSON File",
+            data=json_str,
+            file_name="extracted_data.json",
+            mime="application/json"
+        )
+        
+        st.subheader("Extracted Data")
+        st.json(json_str)
