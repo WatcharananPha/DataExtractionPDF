@@ -3,9 +3,8 @@ import google.generativeai as genai
 import json
 import tempfile
 import os
-import gspread
 import re
-from difflib import SequenceMatcher
+import gspread
 from google.oauth2.service_account import Credentials
 from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv
@@ -29,7 +28,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file"
 ]
-CREDS_FILE = 'glassy-keyword-466817-t8-8bdc0c7acadc.json'
+CREDS_FILE = os.getenv("CREDS_JSON_ENV")
 DEFAULT_SHEET_ID = '17tMHStXQYXaIQHQIA4jdUyHaYt_tuoNCEEuJCstWEuw'
 
 COMPANY_NAME_ROW = 1
@@ -37,7 +36,19 @@ CONTACT_INFO_ROW = 2
 HEADER_ROW = 3
 ITEM_MASTER_LIST_COL = 2
 COLUMNS_PER_SUPPLIER = 4
-SIMILARITY_THRESHOLD = 0.7
+
+def extract_sheet_id_from_url(url):
+    if not url:
+        return None
+
+    if "/" not in url and " " not in url and len(url) > 20:
+        return url
+
+    match = re.search(r'spreadsheets/d/([a-zA-Z0-9-_]+)', url)
+    if match:
+        return match.group(1)
+            
+    return None
 
 prompt = """# System Message for Product List Extraction (PDF/Text Table Processing)
 
@@ -106,6 +117,21 @@ You must return ONLY this JSON structure:
 * Extract each line item separately - do not combine or consolidate pricing
 * If the quote has discount items, select only the discounted price
 
+### CRITICAL: summaryItems and pricing summaries
+* Extract ALL pricing summary items found at the end of the document into the summaryItems array
+* Each summaryItem must have both a "label" and a "value" field
+* Common labels to look for (extract EXACTLY as shown in document):
+  - "รวม", "รวมเป็นเงิน", "ราคารวม", "Total", "TOTAL AMOUNT", "รวมราคา" - the initial subtotal
+  - "ภาษีมูลค่าเพิ่ม 7%", "VAT 7%" - the VAT amount
+  - "ค่าดำเนินการ 10%", "ค่าดำเนินการกำไร 12%", "Operating fee" - administrative fees
+  - "ยอดรวมทั้งสิ้น", "รวมทั้งหมด", "รวมเงินทั้งสิน", "ราคารวมสุทธิ", "รวมราคางานทั้งหมดตามสัญญา", "TOTAL AMOUNT OF TENDER (INCLUDING VAT)" - the final total
+* Extract the numeric values from each summary item exactly as shown (remove any commas, currency symbols)
+* IMPORTANT: Also populate these specific fields:
+  - totalPrice: Use the value from label matching "รวม", "รวมเป็นเงิน", "ราคารวม", "Total", etc. (subtotal before VAT)
+  - totalVat: Use the value from label matching "ภาษีมูลค่าเพิ่ม 7%", "VAT 7%"
+  - totalPriceIncludeVat: Use the value from label matching "ยอดรวมทั้งสิ้น", "รวมทั้งหมด", "รวมราคางานทั้งหมดตามสัญญา", etc. (final total)
+* CRITICAL: All labels and numeric values must be extracted EXACTLY as shown in the document
+
 ## Complete Product Extraction Algorithm
 1. Identify all line items with product descriptions, quantities, and prices
 2. Extract each line item as a separate product - do not group or consolidate
@@ -126,6 +152,8 @@ You must return ONLY this JSON structure:
 - [ ] Product names include all distinguishing characteristics
 - [ ] Quantities and prices match exactly what's shown in quotation
 - [ ] No line items missed - complete extraction achieved
+- [ ] All summaryItems accurately captured with exact labels and values
+- [ ] totalPrice, totalVat, and totalPriceIncludeVat correctly mapped to appropriate summary values
 
 ## Final Notes
 * PRIMARY GOAL: Extract every single product line item - quotations contain unique, detailed specifications
@@ -134,6 +162,35 @@ You must return ONLY this JSON structure:
 * Match unit and quantity with pricePerUnit exactly as shown in quotation
 * Maintain complete fidelity to the original quotation structure and details
 * If the quote has discount items, select only the discounted price
+* Ensure ALL summary pricing items are captured with exact labels and values
+"""
+
+matching_prompt = """
+You're a product matching expert for construction materials in Thailand. Analyze products from List B against List A to find matches.
+
+Matching criteria (in order of importance):
+1. Material type (กระจก, อลูมิเนียม, เหล็ก, ไม้, etc.)
+2. Product thickness (e.g., 10 มม., 12 มม.)
+3. Product type/function (บานเลื่อน, บานสวิง, บานพับ, etc.)
+4. Dimensions and measurements 
+5. Location specifications
+
+Consider these important rules:
+- Two products match if they refer to the same physical item despite minor description variations
+- Glass products must match thickness AND type exactly
+- Different dimensions usually indicate different products
+- Different locations (ชั้น 1, ชั้น 2, etc.) indicate different products
+- Similar products with different finishes/colors are NOT matches
+
+Return ONLY a JSON array of integers where each position corresponds to a product in List B:
+- If a match exists in List A, return its index (0-based)
+- If no match exists, return -1
+
+List A:
+{list_a}
+
+List B:
+{list_b}
 """
 
 def extract_json_from_text(text):
@@ -159,148 +216,97 @@ def ensure_first_three_rows_exist(worksheet):
     if payloads:
         worksheet.batch_update(payloads, value_input_option='USER_ENTERED')
 
-def extract_key_product_features(product_name):
-    # Extract material type
-    material_types = ["กระจก", "อลูมิเนียม", "เหล็ก", "ไม้", "พลาสติก", "สแตนเลส"]
-    material = next((m for m in material_types if m in product_name), "")
+def find_next_available_column(worksheet):
+    all_values = worksheet.get_all_values()
+    max_col = ITEM_MASTER_LIST_COL  # Start with the item master list column
     
-    # Extract dimensions if present
-    dimensions = re.findall(r'\d+(?:\.\d+)?(?:\s*[xX×]\s*\d+(?:\.\d+)?)+(?:\s*(?:ม\.|มม\.|cm|MM|mm))?', product_name)
-    dims = dimensions[0] if dimensions else ""
+    if all_values:
+        for row in all_values[:HEADER_ROW]:  # Check header rows only
+            for i, cell in enumerate(row):
+                if cell.strip():  # If cell has content
+                    max_col = max(max_col, i + 1)  # +1 because sheets are 0-indexed but columns start at 1
     
-    # Extract thickness if present
-    thickness = re.findall(r'(\d+(?:\.\d+)?)\s*(?:มม\.|mm)', product_name)
-    thick = thickness[0] if thickness else ""
-    
-    # Extract location information if present
-    locations = ["ชั้น", "บันได", "ห้อง", "ประตู", "หน้าต่าง"]
-    location = next((loc for loc in locations if loc in product_name), "")
-    
-    # Extract product type or function
-    product_types = ["บานเลื่อน", "บานสวิง", "บานพับ", "บานกระทุ้ง", "บานเปิด", "บานเฟี้ยม", "กระจกเปลือย"]
-    prod_type = next((pt for pt in product_types if pt in product_name), "")
-    
-    return {
-        "material": material,
-        "dimensions": dims,
-        "thickness": thick,
-        "location": location,
-        "product_type": prod_type,
-        "full_name": product_name
-    }
+    return max_col + 1  # Next available column
 
-def calculate_product_similarity(product1, product2):
-    # Extract key features
-    features1 = extract_key_product_features(product1)
-    features2 = extract_key_product_features(product2)
+def match_products_with_gemini(existing_products, new_products):
+    formatted_prompt = matching_prompt.format(
+        list_a=json.dumps(existing_products, ensure_ascii=False),
+        list_b=json.dumps(new_products, ensure_ascii=False)
+    )
     
-    # Calculate basic text similarity
-    name_similarity = SequenceMatcher(None, product1, product2).ratio()
+    response = genai.GenerativeModel(model_name="gemini-2.5-flash").generate_content(formatted_prompt)
     
-    # Calculate feature-specific similarities
-    material_match = 1.0 if features1["material"] and features1["material"] == features2["material"] else 0.0
-    thickness_match = 1.0 if features1["thickness"] and features1["thickness"] == features2["thickness"] else 0.0
-    product_type_match = 1.0 if features1["product_type"] and features1["product_type"] == features2["product_type"] else 0.0
+    matches_text = response.text.strip()
     
-    # Weighted similarity score (adjust weights as needed)
-    weighted_score = (name_similarity * 0.4) + (material_match * 0.25) + (thickness_match * 0.2) + (product_type_match * 0.15)
+    if '```' in matches_text:
+        code_block_pattern = r'```(?:json)?(.*?)```'
+        matches = re.findall(code_block_pattern, matches_text, re.DOTALL)
+        if matches:
+            matches_text = matches[0].strip()
     
-    return weighted_score
+    if matches_text.lower().startswith('json'):
+        matches_text = matches_text[4:].strip()
+    
+    array_pattern = r'\[(.*?)\]'
+    array_matches = re.search(array_pattern, matches_text, re.DOTALL)
+    if array_matches:
+        matches_text = f"[{array_matches.group(1)}]"
+    
+    if not matches_text:
+        return [-1] * len(new_products)
+    
+    try:
+        matches = json.loads(matches_text)
+        if not isinstance(matches, list):
+            matches = [-1] * len(new_products)
+    except json.JSONDecodeError:
+        matches = [-1] * len(new_products)
+    
+    if len(matches) < len(new_products):
+        matches.extend([-1] * (len(new_products) - len(matches)))
+    
+    return matches
 
-def find_matching_products(new_product, existing_products):
-    scores = []
-    for i, existing in enumerate(existing_products):
-        similarity = calculate_product_similarity(new_product, existing)
-        if similarity >= SIMILARITY_THRESHOLD:
-            scores.append((i, similarity))
-    
-    # Return best match if any
-    return max(scores, key=lambda x: x[1])[0] if scores else None
+def check_sheet_template(worksheet):
+    try:
+        header_row = worksheet.row_values(HEADER_ROW)
+        if header_row and len(header_row) >= 3 and "ปริมาณ" in header_row and "หน่วย" in header_row and "ราคาต่อหน่วย" in header_row:
+            return True
+        return False
+    except:
+        return False
 
 def update_google_sheet_with_multiple_files(worksheet, all_json_data):
     ensure_first_three_rows_exist(worksheet)
     
-    # Get existing product items from column B (after header rows)
-    existing_items = worksheet.col_values(ITEM_MASTER_LIST_COL)[3:]
-    start_row_index = 4  # Start after header rows
+    # Check if sheet template is valid
+    has_valid_template = check_sheet_template(worksheet)
+    if not has_valid_template:
+        st.warning("Sheet template is not valid. Creating basic template.")
     
+    # Get existing items and their metadata
+    existing_items = worksheet.col_values(ITEM_MASTER_LIST_COL)[3:]
+    existing_data = {}
+    
+    # Get all sheet data to analyze structure
+    all_values = worksheet.get_all_values()
+    if len(all_values) > HEADER_ROW:
+        # Create a mapping of product names to their row indices
+        for i, row in enumerate(all_values[HEADER_ROW:], start=HEADER_ROW+1):
+            if len(row) > ITEM_MASTER_LIST_COL-1 and row[ITEM_MASTER_LIST_COL-1].strip():
+                existing_data[row[ITEM_MASTER_LIST_COL-1]] = i
+    
+    start_row_index = 4
     payloads = []
     
-    # First supplier's data is added directly
     if all_json_data:
-        first_json_data = all_json_data[0]
-        supplier_col_start = ITEM_MASTER_LIST_COL + 1
+        # Find the next available column after the last used column
+        next_col = find_next_available_column(worksheet)
         
-        # Add company name and contact info
-        payloads.append({
-            'range': f"{get_column_letter(supplier_col_start)}{COMPANY_NAME_ROW}",
-            'values': [[first_json_data["company"]]]
-        })
-        
-        payloads.append({
-            'range': f"{get_column_letter(supplier_col_start)}{CONTACT_INFO_ROW}",
-            'values': [[first_json_data["contact"] or ""]]
-        })
-        
-        # Add header row
-        payloads.append({
-            'range': f"{get_column_letter(supplier_col_start)}{HEADER_ROW}:{get_column_letter(supplier_col_start + 3)}{HEADER_ROW}",
-            'values': [["ปริมาณ", "หน่วย", "ราคาต่อหน่วย", "รวมเป็นเงิน"]]
-        })
-        
-        # Add all products from first supplier
-        for product in first_json_data["products"]:
-            product_name = product["name"]
-            existing_items.append(product_name)
-            row_index = len(existing_items) + start_row_index - 1
+        for idx, json_data in enumerate(all_json_data):
+            supplier_col_start = next_col + (idx * COLUMNS_PER_SUPPLIER)
             
-            payloads.append({
-                'range': f"B{row_index}",
-                'values': [[product_name]]
-            })
-            
-            payloads.append({
-                'range': f"{get_column_letter(supplier_col_start)}{row_index}:{get_column_letter(supplier_col_start + 3)}{row_index}",
-                'values': [[product["quantity"], product["unit"], product["pricePerUnit"], product["totalPrice"]]]
-            })
-        
-        # Add summary rows for first supplier
-        summary_start_row = len(existing_items) + start_row_index + 1
-        
-        payloads.append({
-            'range': f"B{summary_start_row}",
-            'values': [["รวมเป็นเงิน"]]
-        })
-        payloads.append({
-            'range': f"{get_column_letter(supplier_col_start + 3)}{summary_start_row}",
-            'values': [[first_json_data["totalPrice"]]]
-        })
-        
-        summary_start_row += 1
-        payloads.append({
-            'range': f"B{summary_start_row}",
-            'values': [["ภาษีมูลค่าเพิ่ม 7%"]]
-        })
-        payloads.append({
-            'range': f"{get_column_letter(supplier_col_start + 3)}{summary_start_row}",
-            'values': [[first_json_data["totalVat"]]]
-        })
-        
-        summary_start_row += 1
-        payloads.append({
-            'range': f"B{summary_start_row}",
-            'values': [["ยอดรวมทั้งสิ้น"]]
-        })
-        payloads.append({
-            'range': f"{get_column_letter(supplier_col_start + 3)}{summary_start_row}",
-            'values': [[first_json_data["totalPriceIncludeVat"]]]
-        })
-        
-        # Process additional suppliers with matching logic
-        for idx, json_data in enumerate(all_json_data[1:], start=1):
-            supplier_col_start = ITEM_MASTER_LIST_COL + 1 + (idx * COLUMNS_PER_SUPPLIER)
-            
-            # Add company name and contact info
+            # Add supplier info
             payloads.append({
                 'range': f"{get_column_letter(supplier_col_start)}{COMPANY_NAME_ROW}",
                 'values': [[json_data["company"]]]
@@ -311,27 +317,31 @@ def update_google_sheet_with_multiple_files(worksheet, all_json_data):
                 'values': [[json_data["contact"] or ""]]
             })
             
-            # Add header row
             payloads.append({
                 'range': f"{get_column_letter(supplier_col_start)}{HEADER_ROW}:{get_column_letter(supplier_col_start + 3)}{HEADER_ROW}",
                 'values': [["ปริมาณ", "หน่วย", "ราคาต่อหน่วย", "รวมเป็นเงิน"]]
             })
             
-            matched_products = []
-            new_products = []
-            
-            # Find matches for each product or add as new
-            for product in json_data["products"]:
-                product_name = product["name"]
-                match_idx = find_matching_products(product_name, existing_items)
+            # Match products with existing ones
+            with st.spinner(f"Matching products for supplier {idx+1}..."):
+                new_product_names = [product["name"] for product in json_data["products"]]
+                match_indices = match_products_with_gemini(existing_items, new_product_names)
                 
-                if match_idx is not None:
-                    # Match found
-                    row_index = match_idx + start_row_index
-                    matched_products.append((product, row_index))
-                else:
-                    # No match, add as new product
-                    new_products.append(product)
+                matched_products = []
+                new_products = []
+                
+                for i, (product, match_idx) in enumerate(zip(json_data["products"], match_indices)):
+                    if match_idx >= 0:
+                        row_index = match_idx + start_row_index
+                        matched_products.append((product, row_index))
+                    else:
+                        # Check if this product is in the master list by exact text match
+                        product_name = product["name"]
+                        if product_name in existing_data:
+                            row_index = existing_data[product_name]
+                            matched_products.append((product, row_index))
+                        else:
+                            new_products.append(product)
             
             # Update matched products
             for product, row_index in matched_products:
@@ -344,7 +354,8 @@ def update_google_sheet_with_multiple_files(worksheet, all_json_data):
             for product in new_products:
                 product_name = product["name"]
                 existing_items.append(product_name)
-                row_index = len(existing_items) + start_row_index - 1
+                existing_data[product_name] = len(existing_items) + start_row_index - 1
+                row_index = existing_data[product_name]
                 
                 payloads.append({
                     'range': f"B{row_index}",
@@ -357,7 +368,7 @@ def update_google_sheet_with_multiple_files(worksheet, all_json_data):
                 })
             
             # Add summary rows
-            summary_start_row = len(existing_items) + start_row_index + 1
+            summary_start_row = max(existing_data.values()) + 2 if existing_data else start_row_index + len(existing_items) + 1
             
             payloads.append({
                 'range': f"B{summary_start_row}",
@@ -387,8 +398,16 @@ def update_google_sheet_with_multiple_files(worksheet, all_json_data):
                 'range': f"{get_column_letter(supplier_col_start + 3)}{summary_start_row}",
                 'values': [[json_data["totalPriceIncludeVat"]]]
             })
-    
-    # Execute all updates in one batch
+            
+            if "match_stats" not in st.session_state:
+                st.session_state.match_stats = {}
+            
+            st.session_state.match_stats[idx] = {
+                "matched": len(matched_products),
+                "new": len(new_products),
+                "total": len(json_data["products"])
+            }
+
     if payloads:
         worksheet.batch_update(payloads, value_input_option='USER_ENTERED')
     
@@ -401,8 +420,6 @@ uploaded_files = st.file_uploader(
 )
 
 sheet_id = st.text_input("Google Sheet ID", value=DEFAULT_SHEET_ID)
-similarity_threshold = st.slider("Product Matching Similarity Threshold", 0.5, 0.95, 0.7, 0.05)
-SIMILARITY_THRESHOLD = similarity_threshold
 
 if st.button("Extract and Update") and uploaded_files and sheet_id:
     all_data = []
@@ -429,28 +446,15 @@ if st.button("Extract and Update") and uploaded_files and sheet_id:
                 
         os.unlink(tmp_file_path)
         progress.progress((idx + 1) / len(uploaded_files))
-    
-    # Update sheet with all extracted data at once
+
     if all_data:
-        with st.spinner("Updating Google Sheet with intelligent product matching..."):
+        with st.spinner("Updating Google Sheet with AI product matching..."):
             suppliers_updated = update_google_sheet_with_multiple_files(worksheet, all_data)
             st.success(f"Updated Google Sheet with data from {suppliers_updated} supplier(s)")
             
-            match_stats = {
-                "total_products": sum(len(json_data["products"]) for json_data in all_data[1:]) if len(all_data) > 1 else 0,
-                "matched_products": 0,
-                "new_products": 0
-            }
-            
-            if len(all_data) > 1:
-                for data in all_data[1:]:
-                    for product in data["products"]:
-                        if st.session_state.get("matched_products", set()):
-                            match_stats["matched_products"] += 1
-                        else:
-                            match_stats["new_products"] += 1
-                
-                st.info(f"Product matching statistics: {match_stats['matched_products']} products matched, {match_stats['new_products']} new products added")
+            if "match_stats" in st.session_state:
+                for idx, stats in st.session_state.match_stats.items():
+                    st.info(f"Supplier {idx+1} product matching: {stats['matched']} products matched, {stats['new']} new products added (total: {stats['total']})")
         
         merged_data = {"extractions": all_data}
         json_str = json.dumps(merged_data, indent=2, ensure_ascii=False)
